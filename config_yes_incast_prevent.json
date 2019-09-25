@@ -1,0 +1,11 @@
+{
+  "debug": 0,
+  "out_dir": "yes_incast_prevent",
+  "num_iterations": 100,
+  "enable_incast_prevention": 1,
+  "grid_size": 16,
+  "sample_period": 100,
+  "request_service_time_dist": "request_service_time_dist.csv",
+  "response_service_time_dist": "response_service_time_dist.csv",
+  "network_delay": [1000]
+}

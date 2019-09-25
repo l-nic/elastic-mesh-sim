@@ -13,8 +13,10 @@ cmd_parser = argparse.ArgumentParser()
 cmd_parser.add_argument('--config', type=str, help='JSON config file to control the simulations', required=True)
 
 class Logger(object):
-    def __init__(self, env):
+    def __init__(self, env, filename):
         self.env = env
+        self.filename = filename
+        self.prefix = ''
 
     @staticmethod
     def init_params():
@@ -22,7 +24,10 @@ class Logger(object):
 
     def log(self, s):
         if Logger.debug:
-            print '{}: {}'.format(self.env.now, s)
+            data = '{}: {}'.format(self.env.now, s)
+            print data
+            with open(self.filename, 'a') as f:
+                f.write(data + '\n')
 
 
 class Message(object):
@@ -66,7 +71,8 @@ class Node(object):
         self.ID = Node.count
         Node.count += 1
         self.iteration_cnt = 0 # local iteration counter
-        self.response_cnt = 0 # count responses in each iterations
+        self.request_cnt = 0 # count requests processed in each iteration
+        self.response_cnt = 0 # count responses in each iteration
         self.neighbors = []
         self.env.process(self.start())
 
@@ -86,13 +92,19 @@ class Node(object):
     def add_neighbor(self, ID):
         self.neighbors.append(ID)
 
+    def log_prefix(self):
+        return 'Node {}: iteration {}: request_cnt: {} response_cnt: {} '.format(self.ID, self.iteration_cnt, self.request_cnt, self.response_cnt)
+
     def start(self):
         """Receive and process messages"""
         while not MeshSimulator.complete:
             # wait for a msg that is for the current iteration
-            msg = yield self.queue.get(filter = lambda msg: msg.iteration == self.iteration_cnt)
-            self.logger.log('Node {}: Processing message: {}'.format(self.ID, str(msg)))
+            self.logger.log(self.log_prefix() + 'Waiting for message to arrive ...')
+            # make sure that we process all requests in the iteration before processing our responses
+            msg = yield self.queue.get(filter = lambda msg: (msg.iteration == self.iteration_cnt) and (type(msg) != Response or (type(msg) == Response and self.request_cnt == len(self.neighbors))))
+            self.logger.log(self.log_prefix() + 'Processing message: {}'.format(str(msg)))
             if type(msg) == Request:
+                self.request_cnt += 1
                 # process request and send back response
                 service_time = Node.request_service_time.next()
                 yield self.env.timeout(service_time)
@@ -100,29 +112,45 @@ class Node(object):
                 self.network.queue.put(Response(self.ID, msg.src, msg.iteration))
             elif type(msg) == Response:
                 self.response_cnt += 1
+                self.logger.log(self.log_prefix() + 'Received {} responses out of {}'.format(self.response_cnt, len(self.neighbors)))
                 if self.response_cnt == len(self.neighbors):
                     # all responses received
                     service_time = Node.response_service_time.next()
                     yield self.env.timeout(service_time)
                     # reset for the next iteration
                     self.iteration_cnt += 1
+                    self.request_cnt = 0
                     self.response_cnt = 0
                     # check if the simulation has completed
                     MeshSimulator.check_done(self.env.now)
-                    if self.iteration_cnt < MeshSimulator.num_iterations:
-                        # optionally perform incast prevention
-                        if Node.enable_incast_prevention == 1:
-                            # wait our turn to send
-                            yield self.env.timeout(Node.request_service_time.next() * random.randint(0,3))
-                        self.logger.log('Node {}: Sending requests to neighbors: {}'.format(self.ID, str(self.neighbors)))
+                    self.logger.log(self.log_prefix() + 'MeshSimulator.complete={}, MeshSimulator.num_iterations={}'.format(MeshSimulator.complete, MeshSimulator.num_iterations))
+                    #if self.iteration_cnt < MeshSimulator.num_iterations:
+                    if not MeshSimulator.complete:
+                        self.logger.log(self.log_prefix() + 'Sending requests to neighbors: {}'.format(str(self.neighbors)))
                         for n in self.neighbors:
-                            self.network.queue.put(Request(self.ID, n, self.iteration_cnt))
+                            msg = Request(self.ID, n, self.iteration_cnt)
+                            # optionally perform incast prevention
+                            if Node.enable_incast_prevention == 1:
+                                # wait our turn to send
+                                delay = Node.request_service_time.next() * random.randint(0,3)
+                                self.logger.log(self.log_prefix() + 'incast prevention enabled, will delay sending for {} ns'.format(delay))
+                                self.env.process(self.transmit_msg(msg, delay))
+                            else:
+                                # send immediately
+                                self.network.queue.put(msg)
             elif type(msg) == Start:
                 # send out initial requests
-                self.logger.log('Node {}: Sending requests to neighbors: {}'.format(self.ID, str(self.neighbors)))
+                self.logger.log(self.log_prefix() + 'Sending requests to neighbors: {}'.format(str(self.neighbors)))
                 for n in self.neighbors:
                     self.network.queue.put(Request(self.ID, n, self.iteration_cnt))
 
+    def transmit_msg(self, msg, delay):
+        self.logger.log(self.log_prefix() + 'Starting to transmit msg: {}'.format(str(msg)))
+        # model the network communication delay
+        yield self.env.timeout(delay)
+        # put the message in the node's queue
+        self.network.queue.put(msg)
+        self.logger.log(self.log_prefix() + 'Transmitted msg: {}'.format(str(msg)))
 
 class Network(object):
     """Network which moves messages between nodes"""
@@ -196,8 +224,11 @@ class MeshSimulator(object):
         MeshSimulator.num_iterations = MeshSimulator.config['num_iterations'].next()
         MeshSimulator.grid_size = MeshSimulator.config['grid_size'].next()
         MeshSimulator.sample_period = MeshSimulator.config['sample_period'].next()
-        self.logger = Logger(env)
-        self.network = Network(self.env, self.logger)
+        network_log_file = os.path.join(MeshSimulator.out_run_dir, 'network.log')
+        # clear network log file
+        with open(network_log_file, 'w') as f:
+            f.write('')
+        self.network = Network(self.env, Logger(env, network_log_file))
 
         Message.count = 0
         Node.count = 0
@@ -205,7 +236,11 @@ class MeshSimulator(object):
         # create nodes
         self.nodes = []
         for i in range(MeshSimulator.grid_size**2):
-            self.nodes.append(Node(self.env, self.logger, self.network))
+            node_log_file = os.path.join(MeshSimulator.out_run_dir, 'node-{}.log'.format(i))
+            # clear node log file
+            with open(node_log_file, 'w') as f:
+                f.write('')
+            self.nodes.append(Node(self.env, Logger(env, node_log_file), self.network))
 
         # add neighbors to each node
         for i in range(MeshSimulator.grid_size**2):
