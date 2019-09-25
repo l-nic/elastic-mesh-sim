@@ -74,6 +74,7 @@ class Node(object):
     def init_params():
         Node.request_service_time = Node.sample_generator(MeshSimulator.config['request_service_time_dist'].next())
         Node.response_service_time = Node.sample_generator(MeshSimulator.config['response_service_time_dist'].next())
+        Node.enable_incast_prevention = MeshSimulator.config['enable_incast_prevention'].next()
 
     @staticmethod
     def sample_generator(filename):
@@ -95,6 +96,7 @@ class Node(object):
                 # process request and send back response
                 service_time = Node.request_service_time.next()
                 yield self.env.timeout(service_time)
+                # TODO: prehaps perform incast prevention here as well? Don't think it is needed because requests shouldn't be synchronized here
                 self.network.queue.put(Response(self.ID, msg.src, msg.iteration))
             elif type(msg) == Response:
                 self.response_cnt += 1
@@ -108,6 +110,10 @@ class Node(object):
                     # check if the simulation has completed
                     MeshSimulator.check_done(self.env.now)
                     if self.iteration_cnt < MeshSimulator.num_iterations:
+                        # optionally perform incast prevention
+                        if Node.enable_incast_prevention == 1:
+                            # wait our turn to send
+                            yield self.env.timeout(Node.request_service_time.next() * random.randint(0,3))
                         self.logger.log('Node {}: Sending requests to neighbors: {}'.format(self.ID, str(self.neighbors)))
                         for n in self.neighbors:
                             self.network.queue.put(Request(self.ID, n, self.iteration_cnt))
