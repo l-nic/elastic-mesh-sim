@@ -12,11 +12,16 @@ import json
 cmd_parser = argparse.ArgumentParser()
 cmd_parser.add_argument('--config', type=str, help='JSON config file to control the simulations', required=True)
 
+def clear_file(filename):
+    with open(filename, 'w') as f:
+        f.write('')
+
 class Logger(object):
     def __init__(self, env, filename):
         self.env = env
         self.filename = filename
-        self.prefix = ''
+        if Logger.debug:
+            clear_file(filename)
 
     @staticmethod
     def init_params():
@@ -218,16 +223,16 @@ class MeshSimulator(object):
     iteration_cnt = 0
     finish_time = 0
     # global logs (across runs)
-    avg_throughput = {'all':[]} # iterations/ns
+    run_log = {'run':[],
+               '50pc_iteration_time':[],
+               '99pc_iteration_time':[],
+               'avg_throughput':[]} # iterations/ns
     def __init__(self, env):
         self.env = env
         MeshSimulator.num_iterations = MeshSimulator.config['num_iterations'].next()
         MeshSimulator.grid_size = MeshSimulator.config['grid_size'].next()
         MeshSimulator.sample_period = MeshSimulator.config['sample_period'].next()
         network_log_file = os.path.join(MeshSimulator.out_run_dir, 'network.log')
-        # clear network log file
-        with open(network_log_file, 'w') as f:
-            f.write('')
         self.network = Network(self.env, Logger(env, network_log_file))
 
         Message.count = 0
@@ -237,9 +242,6 @@ class MeshSimulator(object):
         self.nodes = []
         for i in range(MeshSimulator.grid_size**2):
             node_log_file = os.path.join(MeshSimulator.out_run_dir, 'node-{}.log'.format(i))
-            # clear node log file
-            with open(node_log_file, 'w') as f:
-                f.write('')
             self.nodes.append(Node(self.env, Logger(env, node_log_file), self.network))
 
         # add neighbors to each node
@@ -265,9 +267,14 @@ class MeshSimulator(object):
 
     def init_sim(self):
         # initialize run local variables
-        self.q_sizes = {n.ID:[] for n in self.nodes}
+        self.q_sizes = {}
         self.q_sizes['time'] = []
-        self.q_sizes['network'] = []
+        self.q_sizes['node'] = []
+        self.q_sizes['qsize'] = []
+        MeshSimulator.iteration_log = {}
+        MeshSimulator.iteration_log['iteration'] = []
+        MeshSimulator.iteration_log['iteration_time'] = []
+        MeshSimulator.iteration_start_time = 0
         MeshSimulator.complete = False
         MeshSimulator.converged_node_cnt = 0
         MeshSimulator.iteration_cnt = 0
@@ -282,10 +289,10 @@ class MeshSimulator(object):
     def sample_queues(self):
         """Sample node queue occupancy"""
         while not MeshSimulator.complete:
-            self.q_sizes['time'].append(self.env.now)
-            self.q_sizes['network'].append(len(self.network.queue.items))
             for n in self.nodes:
-                self.q_sizes[n.ID].append(len(n.queue.items))
+                self.q_sizes['time'].append(self.env.now)
+                self.q_sizes['node'].append(n.ID)
+                self.q_sizes['qsize'].append(len(n.queue.items))
             yield self.env.timeout(MeshSimulator.sample_period)
 
     @staticmethod
@@ -294,6 +301,11 @@ class MeshSimulator(object):
         MeshSimulator.converged_node_cnt += 1
         # increment the iteration_cnt if all nodes have converged
         if MeshSimulator.converged_node_cnt == MeshSimulator.grid_size**2:
+            # record iteration time
+            MeshSimulator.iteration_log['iteration'].append(MeshSimulator.iteration_cnt)
+            MeshSimulator.iteration_log['iteration_time'].append(now - MeshSimulator.iteration_start_time)
+            MeshSimulator.iteration_start_time = now
+            # increment iteration
             MeshSimulator.iteration_cnt += 1
             MeshSimulator.converged_node_cnt = 0
         # simulation is complete after all iterations
@@ -307,19 +319,26 @@ class MeshSimulator(object):
         if not os.path.exists(out_dir):
             os.makedirs(out_dir)
 
-        # log the measured avg queue sizes
+        # log the measured queue sizes
         df = pd.DataFrame(self.q_sizes)
         write_csv(df, os.path.join(MeshSimulator.out_run_dir, 'q_sizes.csv'))
 
+        # log the iteration_log 
+        df = pd.DataFrame(MeshSimulator.iteration_log)
+        write_csv(df, os.path.join(MeshSimulator.out_run_dir, 'iteration_log.csv'))
+
         # record avg throughput for this run in terms of iterations/microsecond
         throughput = 1e3*float(MeshSimulator.num_iterations)/(MeshSimulator.finish_time)
-        MeshSimulator.avg_throughput['all'].append(throughput)
+        MeshSimulator.run_log['run'].append(MeshSimulator.run_cnt)
+        MeshSimulator.run_log['50pc_iteration_time'].append(np.percentile(MeshSimulator.iteration_log['iteration_time'], 50))
+        MeshSimulator.run_log['99pc_iteration_time'].append(np.percentile(MeshSimulator.iteration_log['iteration_time'], 99))
+        MeshSimulator.run_log['avg_throughput'].append(throughput)
 
     @staticmethod
     def dump_global_logs():
         # log avg throughput
-        df = pd.DataFrame(MeshSimulator.avg_throughput)
-        write_csv(df, os.path.join(MeshSimulator.out_dir, 'avg_throughput.csv'))
+        df = pd.DataFrame(MeshSimulator.run_log)
+        write_csv(df, os.path.join(MeshSimulator.out_dir, 'run_log.csv'))
 
 def write_csv(df, filename):
     with open(filename, 'w') as f:
@@ -357,10 +376,10 @@ def run_mesh_sim(cmdline_args):
     # copy config file into output directory
     os.system('cp {} {}'.format(cmdline_args.config, out_dir))
     # run the simulations
-    run_cnt = 0
+    MeshSimulator.run_cnt = 0
     try:
         while True:
-            print 'Running simulation {} ...'.format(run_cnt)
+            print 'Running simulation {} ...'.format(MeshSimulator.run_cnt)
             # initialize random seed
             random.seed(1)
             np.random.seed(1)
@@ -369,8 +388,10 @@ def run_mesh_sim(cmdline_args):
             Message.init_params()
             Node.init_params()
             Network.init_params()
-            MeshSimulator.out_run_dir = os.path.join(MeshSimulator.out_dir, 'run-{}'.format(run_cnt))
-            run_cnt += 1
+            MeshSimulator.out_run_dir = os.path.join(MeshSimulator.out_dir, 'run-{}'.format(MeshSimulator.run_cnt))
+            if not os.path.exists(MeshSimulator.out_run_dir):
+                os.makedirs(MeshSimulator.out_run_dir)
+            MeshSimulator.run_cnt += 1
             env = simpy.Environment()
             s = MeshSimulator(env)
             env.run()
